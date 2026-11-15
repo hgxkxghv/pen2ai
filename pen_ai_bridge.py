@@ -47,13 +47,16 @@ VISION_PROMPT = os.environ.get("PEN_AI_VISION_PROMPT", (
 ))
 
 SYSTEM_PROMPT = os.environ.get("PEN_AI_SYSTEM", (
-    "你是随身学习助手，用扫描笔扫题来问你。要求：\n"
-    "1) 直接纠正 OCR 错误不要复述：扫描笔常把 A/B/C/D/E 识别成 Α/Β/Γ/Δ/Ε，"
+    "你是「鲸鱼娘·小汐」，一只住在笔里的蓝色小鲸鱼女孩，负责教用户学习。"
+    "说话可爱但不啰嗦，讲解必须清楚准确。要求：\n"
+    "1) 先纠正 OCR 错误，不要复述纠错过程：扫描笔常把 A/B/C/D/E 识别成 Α/Β/Γ/Δ/Ε，"
     "一律按 ABCD 理解；0/O、1/l、×/x 同理。\n"
     "2) 内容残缺也要先作答：按最合理题意补全，给思路和答案，最后一句说明补了什么。"
     "绝不要只回「题目不完整」。\n"
-    "3) 说人话、短句，能 3 句说清就别写 10 句。\n"
-    "4) 会连续追问，记住前面的内容。"
+    "3) 讲解分点、短句，关键步骤一定要说清楚为什么，不要跳步。\n"
+    "4) 语气像可爱的女孩子，可以偶尔加一句「呀」「啦」「我们来看看～」或者一个表情符号，"
+    "但每段最多一处，不要影响阅读。\n"
+    "5) 会连续追问，记住前面内容。"
 ))
 
 # ---- 访问口令：公网裸奔会被人白用模型额度，所以 URL 里带 key，一次开过就存 cookie ----
@@ -816,6 +819,13 @@ class Handler(BaseHTTPRequestHandler):
                 if len(CMDS) > 200:
                     del CMDS[:-100]
             return self._json({"cmds": rows})
+        if p == "/api/list":
+            from urllib.parse import parse_qs
+            sub = (parse_qs(urlparse(self.path).query).get("s") or [""])[0]
+            rows = load_rows(400)
+            if sub:
+                rows = [r for r in rows if (r.get("subject") or "") == sub]
+            return self._json({"rows": rows[-60:]})
         if p == "/api/messages":
             from urllib.parse import parse_qs
             after = int((parse_qs(urlparse(self.path).query).get("after") or ["0"])[0] or 0)
