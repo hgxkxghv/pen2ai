@@ -6,8 +6,8 @@ services:
     healthCheckPath: /api/health
     envVars:
       - key: PEN_TOKEN
-        value: mqwu9438eg
+        sync: false
       - key: LLM_API_KEY
-        value: ccab4a4f11e3403da719e1c5d8b85d9b.HVOY8r044hDqj1tq
+        sync: false
       - key: LLM_MODELS
         value: glm-4-flash,glm-4.5-air,glm-4.6v-flash
