@@ -15,4 +15,4 @@ services:
       - key: DOUBAO_MODEL
         value: doubao-seed-1-6-flash
       - key: LLM_MODELS
-        value: glm-4.5-air,glm-4-flash,glm-4.5-flash
+        value: glm-4.5-flash,glm-4.5-air,glm-4-flash
