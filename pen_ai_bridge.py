@@ -432,13 +432,15 @@ def _is_question(text):
     return len(t) >= 24
 
 
-def rev_capture(q, a, subject):
-    """扫到的东西自动进本子：题目→错题本，英文词→生词本。同一题不重复收。"""
+def rev_capture(q, a, subject, kind=None):
+    """扫到的东西自动进本子：题目→错题本，英文词→生词本。同一题不重复收。
+    kind 传 "word"/"mistake" 时按指定类型收（网页上手动补条用）。"""
     q = (q or "").strip()
     a = (a or "").strip()
     if not q or not a:
         return None
-    kind = "word" if _is_word(q) else ("mistake" if _is_question(q) else None)
+    kind = kind if kind in ("word", "mistake") else (
+        "word" if _is_word(q) else ("mistake" if _is_question(q) else None))
     if not kind:
         return None
     with _lock:
@@ -1093,17 +1095,53 @@ h1{font-size:19px;margin:0 0 10px}
  color:#e6edf3;font-size:14px}
 .ops button.dim{background:#21262d;color:#8b949e}
 .empty{color:#6e7681;font-size:14px;padding:20px 4px}
+.addbox{background:#161b22;border:1px dashed #30363d;border-radius:12px;padding:10px 12px;margin-bottom:12px}
+.addbox summary{color:#7ec8ff;font-size:15px;cursor:pointer}
+.addbox input,.addbox textarea,.addbox select{width:100%%;box-sizing:border-box;margin-top:8px;
+ background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:9px;padding:9px 10px;
+ font:15px/1.45 system-ui,sans-serif}
+.addbox textarea{height:70px;resize:vertical}
+.addbox .row2{display:flex;gap:8px;margin-top:8px}
+.addbox .row2 select{flex:1;margin-top:0}
+.addbox button{width:100%%;margin-top:10px;padding:11px 0;border-radius:10px;border:0;
+ background:#4c9aff;color:#06121f;font-size:15px;font-weight:700}
+.hint{color:#6e7681;font-size:12px;margin-top:6px}
 </style></head><body>
-<h1>复习</h1>%s
+<h1>复习</h1>
+<details class="addbox"><summary>＋ 手动加一条（不用扫，直接录）</summary>
+<textarea id="nq" placeholder="题目 / 单词 / 要记的内容"></textarea>
+<textarea id="na" placeholder="答案（可留空）"></textarea>
+<div class="row2">
+ <select id="nk"><option value="">自动判断</option><option value="mistake">错题本</option><option value="word">生词本</option></select>
+ <select id="ns"><option value="">自动分学科</option><option>数学</option><option>英语</option><option>语文</option><option>物理</option><option>化学</option><option>生物</option><option>其他</option></select>
+</div>
+<button onclick="addOne(this)">加进复习本</button>
+<p class="hint">加进来就是第 1 档，今天就能复习。</p>
+</details>%s
 <script>
 function mk(id, r){
   fetch('/api/review/mark', {method:'POST', headers:{'Content-Type':'application/json',
     'X-Pen-Key':'%s'}, body: JSON.stringify({id:id, result:r})})
     .then(function(){ location.reload(); });
 }
+function addOne(btn){
+  var q=document.getElementById('nq').value.trim();
+  if(!q){ btn.textContent='先写点内容'; setTimeout(function(){btn.textContent='加进复习本';},1200); return; }
+  var body={q:q, a:document.getElementById('na').value.trim(),
+            kind:document.getElementById('nk').value, subject:document.getElementById('ns').value};
+  btn.disabled=true; btn.textContent='加…';
+  fetch('/api/review/add', {method:'POST', headers:{'Content-Type':'application/json',
+    'X-Pen-Key':'%s'}, body: JSON.stringify(body)})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if(d && d.ok){ location.reload(); }
+      else { btn.disabled=false; btn.textContent='没加进去，检查内容'; }
+    })
+    .catch(function(){ btn.disabled=false; btn.textContent='网络不通，再试'; });
+}
 </script>
 %s
-</body></html>""" % (tabbar, TOKEN, "".join(cards))
+</body></html>""" % (tabbar, TOKEN, TOKEN, "".join(cards))
 
 
 def log_page(sel=""):
@@ -1509,7 +1547,9 @@ class Handler(BaseHTTPRequestHandler):
             q = str(data.get("q") or "").strip()
             if not q:
                 return self._json({"error": "q 必填"}, 400)
-            rec = rev_capture(q, str(data.get("a") or "（手动添加）"), classify(q))
+            _kind = str(data.get("kind") or "").strip() or None
+            _subj = str(data.get("subject") or "").strip() or classify(q)
+            rec = rev_capture(q, str(data.get("a") or "（手动添加）"), _subj, _kind)
             return self._json({"ok": bool(rec), "item": rec})
         if p == "/api/do":   # 外部下发一条要笔执行的指令
             act = str(data.get("act") or "")
