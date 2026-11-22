@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>UI 设计器</title>
+<style>
+ body{margin:0;background:#0d1117;color:#c9d1d9;font:13px/1.45 system-ui,"PingFang SC",sans-serif;padding-bottom:56px}
+ #bar{position:sticky;top:0;display:flex;gap:6px;align-items:center;padding:6px 8px;background:#161b22;border-bottom:1px solid #30363d;z-index:9}
+ #bar b{flex:1;font-size:13px;color:#e6edf3}
+ #bar i{font-style:normal;font-size:11px;color:#7d8590}
+ button{background:#21262d;border:1px solid #30363d;color:#c9d1d9;border-radius:8px;padding:6px 10px;font:13px inherit}
+ button.pri{background:#4c9aff;border-color:#4c9aff;color:#06121f;font-weight:700}
+ #pv{width:100%;height:36vh;min-height:120px;border:0;background:#000;border-bottom:1px solid #30363d;display:block}
+ .row{display:flex;align-items:center;gap:8px;padding:5px 8px;border-bottom:1px solid #1b2129}
+ .row>span{flex:0 0 78px;color:#8b949e;font-size:12px}
+ .row input[type=range]{flex:1;min-width:40px}
+ .row input[type=color]{width:36px;height:26px;padding:0;border:1px solid #30363d;background:none;border-radius:6px}
+ .row output{flex:0 0 42px;text-align:right;font-size:12px}
+ .row select{flex:1;background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:8px;padding:4px}
+ .chips{display:flex;gap:6px;flex-wrap:wrap;padding:6px 8px;border-bottom:1px solid #1b2129}
+ .chip{padding:4px 9px;border-radius:14px;font-size:12px}
+ .box{padding:6px 8px}
+ textarea{width:100%;box-sizing:border-box;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;
+   border-radius:8px;padding:8px;font:12px/1.5 inherit;min-height:52px}
+ .foot{position:fixed;bottom:0;left:0;right:0;display:flex;gap:6px;padding:6px;background:#161b22;
+   border-top:1px solid #30363d}
+ .foot button{flex:1}
+ @media (max-height:430px){ #pv{height:130px} .row{padding:3px 8px} .row>span{flex-basis:60px;font-size:11px} }
+</style></head><body>
+
+<div id="bar"><b>UI 设计器</b><i id="msg"></i>
+  <button id="reload">刷新预览</button>
+  <button class="pri" id="save">保存生效</button></div>
+
+<iframe id="pv" src="/?pv=1"></iframe>
+
+<div class="chips">
+  <button class="chip" data-p="dark">暗夜</button>
+  <button class="chip" data-p="paper">纸白</button>
+  <button class="chip" data-p="eye">护眼</button>
+  <button class="chip" data-p="warm">暖黄</button>
+  <button class="chip" data-p="mono">极简黑白</button>
+</div>
+
+<div class="row"><span>背景色</span><input type="color" data-k="bg"><span style="flex:1"></span>
+  <span>卡片色</span><input type="color" data-k="card"></div>
+<div class="row"><span>文字色</span><input type="color" data-k="ink"><span style="flex:1"></span>
+  <span>强调色</span><input type="color" data-k="accent"></div>
+<div class="row"><span>提问底色</span><input type="color" data-k="q"></div>
+
+<div class="row"><span>圆角</span><input type="range" data-k="r" min="0" max="24" step="1"><output id="o-r"></output></div>
+<div class="row"><span>字号</span><input type="range" data-k="fs" min="14" max="24" step="1"><output id="o-fs"></output></div>
+<div class="row"><span>行距</span><input type="range" data-k="lh" min="1.2" max="2" step="0.05"><output id="o-lh"></output></div>
+
+<div class="row"><span>气泡样式</span>
+  <select data-k="style">
+    <option value="card">卡片（有边框）</option>
+    <option value="bubble">圆气泡</option>
+    <option value="plain">无边框</option>
+  </select></div>
+<div class="row"><span>顶部状态栏</span>
+  <select data-k="hideTop"><option value="0">显示</option><option value="1">隐藏</option></select></div>
+
+<div class="box">
+  <div style="color:#8b949e;font-size:12px;margin-bottom:6px">还想怎么改（中文写，会一起存给我看）</div>
+  <textarea id="note" placeholder="例如：发送按钮改成右侧圆形浮动；提问气泡靠右；答案带学科小标签…"></textarea>
+</div>
+
+<div class="box" style="display:flex;gap:6px;align-items:center">
+  <input type="file" id="ref" accept="image/*" style="flex:1;font-size:12px">
+  <button id="up">上传参考图</button>
+</div>
+<div class="box" id="refbox" style="display:none"><img id="refimg" style="max-width:100%;border-radius:8px"></div>
+
+<div class="foot">
+  <button id="exp">导出/复制参数</button>
+  <button id="reset">恢复默认</button>
+  <button id="close">返回答题</button>
+</div>
+
+<script>
+var D={bg:'#0d1117',card:'#161b22',ink:'#e6edf3',accent:'#4c9aff',q:'#1b2430',
+       r:12,fs:17,lh:1.55,style:'card',hideTop:0,note:''};
+var PRESETS={
+ dark:{bg:'#0d1117',card:'#161b22',ink:'#e6edf3',accent:'#4c9aff',q:'#1b2430',r:12,fs:17,lh:1.55,style:'card',hideTop:0},
+ paper:{bg:'#f6f7f9',card:'#ffffff',ink:'#1f2328',accent:'#0969da',q:'#eaeef2',r:10,fs:17,lh:1.6,style:'card',hideTop:0},
+ eye:{bg:'#16211c',card:'#1c2b24',ink:'#d6e4dc',accent:'#3fb950',q:'#21362c',r:14,fs:17,lh:1.7,style:'bubble',hideTop:0},
+ warm:{bg:'#1d1610',card:'#2a2018',ink:'#f0e2cc',accent:'#e8a33d',q:'#33261a',r:16,fs:18,lh:1.7,style:'bubble',hideTop:0},
+ mono:{bg:'#000000',card:'#0a0a0a',ink:'#eaeaea',accent:'#ffffff',q:'#141414',r:20,fs:17,lh:1.6,style:'plain',hideTop:1}
+};
+var pv=document.getElementById('pv'), msg=document.getElementById('msg');
+
+function css(d){
+  var t=[];
+  t.push('body{background:'+d.bg+' !important;color:'+d.ink+' !important;font-size:'+d.fs+'px !important;line-height:'+d.lh+' !important}');
+  t.push('textarea{background:'+d.card+' !important;color:'+d.ink+' !important;border-radius:'+d.r+'px !important}');
+  t.push('.msg{background:'+d.card+' !important;color:'+d.ink+' !important;border-radius:'+d.r+'px !important}');
+  t.push('.msg.q{background:'+d.q+' !important;color:'+d.ink+' !important}');
+  t.push('.send{background:'+d.accent+' !important;border-radius:'+d.r+'px !important}');
+  t.push('.clr{background:'+d.card+' !important;color:'+d.ink+' !important;border-radius:'+d.r+'px !important}');
+  t.push('.cp{background:'+d.card+' !important;color:'+d.ink+' !important}');
+  t.push('.bottom{background:'+d.bg+' !important}');
+  if(+d.hideTop) t.push('.top{display:none !important}');
+  if(d.style==='bubble') t.push('.msg{border-radius:18px !important}');
+  if(d.style==='plain') t.push('.msg,.msg.q{background:transparent !important;border:0 !important;padding-left:2px !important}');
+  return t.join('\n');
+}
+function apply(){
+  try{
+    var doc=pv.contentDocument; if(!doc||!doc.documentElement) return;
+    var el=doc.getElementById('dskin');
+    if(!el){ el=doc.createElement('style'); el.id='dskin'; doc.head.appendChild(el); }
+    el.textContent=css(D);
+  }catch(e){}
+  for(var k in D){ if(k==='note') continue;
+    var el=document.querySelector('[data-k="'+k+'"]');
+    if(!el) continue;
+    if(el.type==='range'){ el.value=D[k]; var o=document.getElementById('o-'+k); if(o) o.textContent=(k==='lh')?D[k]:D[k]; }
+    else el.value=D[k];
+  }
+  document.getElementById('note').value=D.note||'';
+}
+function save(){
+  D.note=document.getElementById('note').value;
+  var x=new XMLHttpRequest();
+  x.open('POST','/api/design',true);
+  x.setRequestHeader('Content-Type','application/json');
+  x.onreadystatechange=function(){
+    if(x.readyState!==4) return;
+    msg.textContent = (x.status===200)? '已保存，刷新页面即生效 ✓' : '保存失败 '+x.status;
+    try{ localStorage.setItem('pen_design', JSON.stringify(D)); }catch(e){}
+  };
+  x.send(JSON.stringify(D));
+}
+document.querySelectorAll('[data-k]').forEach(function(el){
+  el.addEventListener('input',function(){
+    var k=el.getAttribute('data-k'), v=el.value;
+    if(el.type==='range') v=parseFloat(v);
+    else if(k==='hideTop') v=parseInt(v,10);
+    D[k]=v; apply();
+  });
+});
+document.querySelectorAll('.chip').forEach(function(b){
+  b.onclick=function(){
+    var p=PRESETS[b.getAttribute('data-p')]; if(!p) return;
+    for(var k in p) D[k]=p[k];
+    apply();
+  };
+});
+document.getElementById('save').onclick=save;
+document.getElementById('reload').onclick=function(){ pv.src='/?pv=1&t='+Date.now(); };
+document.getElementById('reset').onclick=function(){ for(var k in PRESETS.dark) D[k]=PRESETS.dark[k]; apply(); };
+document.getElementById('close').onclick=function(){ location.href='/'; };
+document.getElementById('exp').onclick=function(){
+  D.note=document.getElementById('note').value;
+  var t=JSON.stringify(D,null,1);
+  var ta=document.createElement('textarea'); ta.value=t; document.body.appendChild(ta);
+  ta.select(); var ok=false; try{ ok=document.execCommand('copy'); }catch(e){}
+  document.body.removeChild(ta);
+  msg.textContent = ok? '参数已复制，粘给我即可' : '浏览器不给复制，见下方';
+  var box=document.getElementById('refbox'); box.style.display='block';
+  document.getElementById('refimg').style.display='none';
+  var pre=document.getElementById('jsonout');
+  if(!pre){ pre=document.createElement('textarea'); pre.id='jsonout'; box.appendChild(pre); }
+  pre.value=t; pre.style.minHeight='90px';
+};
+document.getElementById('up').onclick=function(){
+  var f=document.getElementById('ref').files[0]; if(!f) return;
+  var fr=new FileReader();
+  fr.onload=function(){
+    var img=document.getElementById('refimg');
+    img.src=fr.result; img.style.display='block';
+    document.getElementById('refbox').style.display='block';
+    var x=new XMLHttpRequest(); x.open('POST','/api/design_ref',true);
+    x.setRequestHeader('Content-Type','application/json');
+    x.onreadystatechange=function(){ if(x.readyState===4) msg.textContent=(x.status===200)?'参考图已存 ✓':'上传失败 '+x.status; };
+    x.send(JSON.stringify({img:fr.result}));
+  };
+  fr.readAsDataURL(f);
+};
+pv.addEventListener('load',apply);
+// 启动：先读服务器当前设计
+var g=new XMLHttpRequest(); g.open('GET','/api/design?t='+Date.now(),true);
+g.onreadystatechange=function(){
+  if(g.readyState!==4) return;
+  try{ var j=JSON.parse(g.responseText); for(var k in j) if(k in D) D[k]=j[k]; }catch(e){}
+  apply();
+};
+g.send();
+</script></body></html>
