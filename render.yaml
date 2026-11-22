@@ -3,11 +3,16 @@ services:
     name: pen2ai
     runtime: docker
     plan: free
+    region: singapore
     healthCheckPath: /api/health
     envVars:
       - key: PEN_TOKEN
-        sync: false
+        value: mqwu9438eg
       - key: LLM_API_KEY
         sync: false
+      - key: ARK_API_KEY
+        sync: false
+      - key: DOUBAO_MODEL
+        value: doubao-seed-1-6-flash
       - key: LLM_MODELS
-        value: glm-4-flash,glm-4.5-air,glm-4.6v-flash
+        value: glm-4.5-air,glm-4-flash,glm-4.5-flash
