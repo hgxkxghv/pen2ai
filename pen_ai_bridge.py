@@ -919,13 +919,13 @@ DL_PAGE = r"""<!doctype html>
 <ol>
  <li>点下面的按钮下载（约 1.8 MB，跟一集图片差不多大）</li>
  <li>下载完点开它安装；如果提示不允许，去 设置 → 安全 → 允许安装未知来源 → 选浏览器，再回来说装</li>
- <li>装好后打开「笔问AI」，地址和口令已经填好了，直接点<b>保存</b></li>
+ <li>装好后打开「笔问AI」，云端地址（pen2ai.onrender.com）和口令已经填好了，直接点<b>保存</b></li>
  <li>再点<b>打开无障碍设置</b>，在列表里找到「笔问AI」，打开开关，确认</li>
  <li>回到笔的学习界面，随便扫一段字 —— 屏幕上会弹出「发出去了」，两三秒后答案就复制到剪贴板并弹出来</li>
 </ol>
 <a class="big" id="dl" href="/apk">下载 笔问AI.apk</a>
 <p class="warn">如果第 5 步没反应：回到 App 点「测试连接」看通不通。</p>
-<p class="note">先自检：地址栏打开 <b id="ping">/ping</b>，出现 pong 就说明这台笔能连到手机。</p>
+<p class="note">先自检：地址栏打开 <b id="ping">/ping</b>，出现 pong 就说明这台笔能连上云端服务器。</p>
 <script>document.getElementById("ping").innerHTML=location.host+"/ping";</script>
 <p class="note">这个工具只读屏幕上的文字发给你自己的服务器，不上传图片、不记录别的内容。</p>
 <script>
