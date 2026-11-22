@@ -51,7 +51,7 @@ DOUBAO_MODEL = (os.environ.get("DOUBAO_MODEL")
 API_KEY = os.environ.get("LLM_API_KEY") or "ccab4a4f11e3403da719e1c5d8b85d9b.HVOY8r044hDqj1tq"
 API_BASE = os.environ.get("LLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4").rstrip("/")
 MODELS = [m.strip() for m in os.environ.get(
-    "LLM_MODELS", "glm-4-flash,glm-4.5-air,glm-4.5-flash").split(",") if m.strip()]
+    "LLM_MODELS", "glm-4.5-flash,glm-4.5-air,glm-4-flash").split(",") if m.strip()]
 if ARK_KEY and not any(m.startswith(("doubao", "ep-", "ark:")) for m in MODELS):
     MODELS.append("doubao:" + DOUBAO_MODEL)
 PORT = int(os.environ.get("PORT") or os.environ.get("PEN_AI_PORT", "8790"))
@@ -846,12 +846,14 @@ function sendFrame(){
   if(busy||!running) return;
   var w=v.videoWidth, h=v.videoHeight;
   if(!w||!h) return;
-  var max=1200, sc=Math.min(1, max/Math.max(w,h));
+  // 只传画面中间横带（题干基本都在中部），分辨率压到 1000，体积约降到原来 45%
+  var max=1000, sc=Math.min(1, max/Math.max(w,h));
+  var sy=Math.round(h*0.12), sh=Math.round(h*0.76);
   var c=document.createElement('canvas');
-  c.width=Math.round(w*sc); c.height=Math.round(h*sc);
-  c.getContext('2d').drawImage(v,0,0,c.width,c.height);
+  c.width=Math.round(w*sc); c.height=Math.round(sh*sc);
+  c.getContext('2d').drawImage(v,0,sy,w,sh,0,0,c.width,c.height);
   var data;
-  try{ data=c.toDataURL('image/jpeg',0.7); }catch(e){ return; }
+  try{ data=c.toDataURL('image/jpeg',0.66); }catch(e){ return; }
   busy=true; lastSent=Date.now(); setSt('识别中…');
   var x=new XMLHttpRequest(); x.open('POST','/api/vision',true);
   x.setRequestHeader('Content-Type','application/json');
@@ -987,12 +989,12 @@ fileInput.onchange=function(){
   st.textContent='图片处理中…';
   var img=new Image(), url=window.URL.createObjectURL(f);
   img.onload=function(){
-    var max=1400, w=img.width, h=img.height;
+    var max=1100, w=img.width, h=img.height;
     if(w>max||h>max){ var s=max/Math.max(w,h); w=Math.round(w*s); h=Math.round(h*s); }
     var c=document.createElement('canvas'); c.width=w; c.height=h;
     c.getContext('2d').drawImage(img,0,0,w,h);
     var data;
-    try{ data=c.toDataURL('image/jpeg',0.82); }catch(e){ st.textContent='浏览器不支持压缩'; return; }
+    try{ data=c.toDataURL('image/jpeg',0.72); }catch(e){ st.textContent='浏览器不支持压缩'; return; }
     st.textContent='识别中…（约 5-15 秒）';
     var x=new XMLHttpRequest(); x.open('POST','/api/vision',true);
     x.setRequestHeader('Content-Type','application/json');
