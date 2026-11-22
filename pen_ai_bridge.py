@@ -29,15 +29,49 @@ BASE = Path(__file__).resolve().parent
 HISTORY = BASE / "history.jsonl"
 CHAT_DIR = BASE / "chats"
 CHAT_DIR.mkdir(exist_ok=True)
+SHOTS = BASE / "shots"                  # APK 上报的截图（真机视觉验收用，按需创建）
+
+# ---- 豆包 / 火山方舟（OpenAI 兼容，模型名以 doubao / ep- 开头就走它）----
+ARK_BASE = os.environ.get("ARK_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3").rstrip("/")
+CFG_FILE = BASE / "config.json"
+
+
+def _cfg():
+    try:
+        return json.loads(CFG_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+ARK_KEY = (os.environ.get("ARK_API_KEY") or str(_cfg().get("ark_key") or "")).strip()
+DOUBAO_MODEL = (os.environ.get("DOUBAO_MODEL")
+                or str(_cfg().get("doubao_model") or "") or "doubao-seed-1-6-250615").strip()
 
 # ---- 模型配置（可用环境变量覆盖）----
 API_KEY = os.environ.get("LLM_API_KEY") or "ccab4a4f11e3403da719e1c5d8b85d9b.HVOY8r044hDqj1tq"
 API_BASE = os.environ.get("LLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4").rstrip("/")
 MODELS = [m.strip() for m in os.environ.get(
     "LLM_MODELS", "glm-4-flash,glm-4.5-air,glm-4.5-flash").split(",") if m.strip()]
+if ARK_KEY and not any(m.startswith(("doubao", "ep-", "ark:")) for m in MODELS):
+    MODELS.append("doubao:" + DOUBAO_MODEL)
 PORT = int(os.environ.get("PORT") or os.environ.get("PEN_AI_PORT", "8790"))
 VISION_MODELS = [m.strip() for m in os.environ.get(
     "LLM_VISION_MODELS", "glm-4.6v-flash,glm-4.5v").split(",") if m.strip()]
+
+# ---- 分层路由：便宜的干简单的活，贵的只在难题上出场 ----
+FAST = os.environ.get("PEN_FAST_MODEL", "glm-4.5-flash")      # 短问题/单词/翻译（4.5-flash 比 4-flash 快一倍多）
+STRONG = os.environ.get("PEN_STRONG_MODEL", "glm-4.5-air")    # 长题干/要推导
+SPARE = os.environ.get("PEN_SPARE_MODEL", "glm-4-flash")      # 兜底（token 最省，偶尔慢）
+DEEP_WORDS = ("详细", "证明", "推导", "为什么", "步骤", "过程", "解释", "分析", "解方程")
+THINK = os.environ.get("PEN_THINK", "off")   # off: 关思考，省 80%+ token；on: 需要推理时才开
+
+CACHE = {}                 # (text, mode) -> [answer, model, ts]
+CACHE_TTL = 6 * 3600       # 同一段内容 6 小时内重复扫描不再调模型
+CACHE_MAX = 240
+USAGE_LOG = BASE / "usage.jsonl"
+REVIEW = BASE / "review.jsonl"       # 错题本 + 生词本
+REV_BOXES = [0, 1, 3, 7, 15, 30]     # 间隔重复：新条目当天就复习，之后 1/3/7/15/30 天
+USAGE = {}                 # 当日统计 {day, calls, prompt, completion, by_model{}}
 VISION_PROMPT = os.environ.get("PEN_AI_VISION_PROMPT", (
     "这是用户用笔或手机拍下来的学习内容。请先在心里完成文字识别（OCR，容忍模糊和歪斜），然后：\n"
     "1) 如果是题目，给出关键步骤和答案；\n"
@@ -54,6 +88,8 @@ SYSTEM_PROMPT = os.environ.get("PEN_AI_SYSTEM", (
     "2) 内容残缺也要先作答：按最合理题意补全，给思路和答案，最后一句说明补了什么。"
     "绝不要只回「题目不完整」。\n"
     "3) 讲解分点、短句，关键步骤一定要说清楚为什么，不要跳步。\n"
+    "3.5) 答案要完整：概念题先给结论再解释；题目要给出完整步骤、最终答案，"
+    "再加一句最容易错的地方。宁可多写两三行，也不要只丢一个结论。\n"
     "4) 语气像可爱的女孩子，可以偶尔加一句「呀」「啦」「我们来看看～」或者一个表情符号，"
     "但每段最多一处，不要影响阅读。\n"
     "5) 会连续追问，记住前面内容。"
@@ -122,7 +158,7 @@ CMD_LOG = []
 
 _lock = threading.Lock()
 CONV = []          # 全局多轮上下文 [{role, content}]
-CONV_MAX = 6       # 只留最近 3 轮，输入短一点响应更快
+CONV_MAX = 4       # 只留最近 2 轮，且每条截断，省 token
 MSG_ID = [0]
 PENDING = [None]   # 手机遥控投递的问题（单笔单人，全局一个）
 
@@ -137,18 +173,45 @@ if HISTORY.exists():
 
 
 # ---------------------------------------------------------------- 模型调用
-def _call_one(model, messages):
+def _think_off(model):
+    """GLM-4.5/4.6 系列默认带思考链，思考 token 也算钱，普通讲题关掉更划算。"""
+    if THINK != "off":
+        return {}
+    m = (model or "")
+    return {"thinking": {"type": "disabled"}} if ("4.5" in m or "4.6" in m) else {}
+
+
+def _provider_of(model):
+    """模型名决定供应商：doubao / ep- / ark: → 火山方舟，其余 → 智谱。"""
+    m = (model or "").strip()
+    if m.startswith("ark:"):
+        return "ark", m[4:]
+    if m.startswith(("doubao", "ep-")) or "ark.cn-beijing" in m:
+        return "ark", m
+    return "glm", m
+
+
+def _call_one(model, messages, max_tokens=1000):
     import urllib.request
-    payload = {"model": model, "messages": messages, "temperature": 0.3,
-               "stream": False, "max_tokens": 700}
+    prov, mid = _provider_of(model)
+    if prov == "ark":
+        base, key = ARK_BASE, ARK_KEY
+        if not key:
+            raise RuntimeError("没配豆包 Key（config.json 里的 ark_key）")
+    else:
+        base, key = API_BASE, API_KEY
+    payload = {"model": mid, "messages": messages, "temperature": 0.3,
+               "stream": False, "max_tokens": max_tokens}
+    if prov == "glm":
+        payload.update(_think_off(mid))
     req = urllib.request.Request(
-        API_BASE + "/chat/completions",
+        base + "/chat/completions",
         data=json.dumps(payload, ensure_ascii=False).encode(),
-        headers={"Content-Type": "application/json", "Authorization": "Bearer " + API_KEY},
+        headers={"Content-Type": "application/json", "Authorization": "Bearer " + key},
     )
-    with urllib.request.urlopen(req, timeout=15) as r:
+    with urllib.request.urlopen(req, timeout=45) as r:
         data = json.loads(r.read().decode())
-    return (data["choices"][0]["message"]["content"] or "").strip()
+    return (data["choices"][0]["message"]["content"] or "").strip(), data.get("usage") or {}
 
 
 def ask_vision(img_b64, mime="image/jpeg"):
@@ -161,11 +224,18 @@ def ask_vision(img_b64, mime="image/jpeg"):
                 {"role": "user", "content": content}]
     errs = []
     for m in VISION_MODELS:
-        payload = {"model": m, "messages": messages, "temperature": 0.2}
+        payload = {"model": m, "messages": messages, "temperature": 0.2,
+                   "max_tokens": 700}
+        prov, mid = _provider_of(m)
+        base = ARK_BASE if prov == "ark" else API_BASE
+        key = ARK_KEY if prov == "ark" else API_KEY
+        payload["model"] = mid
+        if prov == "glm":
+            payload.update(_think_off(mid))
         req = urllib.request.Request(
-            API_BASE + "/chat/completions",
+            base + "/chat/completions",
             data=json.dumps(payload, ensure_ascii=False).encode(),
-            headers={"Content-Type": "application/json", "Authorization": "Bearer " + API_KEY})
+            headers={"Content-Type": "application/json", "Authorization": "Bearer " + key})
         try:
             with urllib.request.urlopen(req, timeout=60) as r:
                 data = json.loads(r.read().decode())
@@ -178,28 +248,126 @@ def ask_vision(img_b64, mime="image/jpeg"):
     return None, "；".join(errs[:3])
 
 
-def ask_model(user_text, prefer=""):
-    """带上多轮上下文；prefer 指定优先模型，失败按顺序换。"""
+def _mode_of(text, hint=""):
+    """判难度：决定用哪个模型、给多少输出预算。"""
+    t = text or ""
+    n = len(t)
+    deep = any(k in t for k in DEEP_WORDS)
+    h = (hint or "").lower()
+    if "air" in h or h in ("strong", "详细", "detailed"):
+        return "strong"
+    if n >= 220 or deep:
+        return "strong"
+    if n <= 30:
+        return "short"
+    return "normal"
+
+
+def _route(mode):
+    if mode == "strong":
+        return [STRONG, FAST, SPARE]
+    return [FAST, STRONG, SPARE]      # 便宜的先上，答得太浅就换强的
+
+
+def _budget(mode, hint=""):
+    if hint in ("详细", "长", "long"):
+        return 1600
+    return {"short": 700, "normal": 1000, "strong": 1600}[mode]
+
+
+def _add_usage(model, usage, cached=False):
+    day = time.strftime("%Y-%m-%d")
     with _lock:
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + CONV[-CONV_MAX:] + \
-                   [{"role": "user", "content": user_text}]
-    errs = []
-    order = MODELS[:]
-    if prefer and prefer in MODELS:
-        order = [prefer] + [m for m in MODELS if m != prefer]
-    for attempt in range(2):            # 两轮，带小退避
-        for m in order:
-            try:
-                out = _call_one(m, messages)
-                if out:
-                    return out, m
-                errs.append(f"{m}:空回复")
-            except Exception as e:
-                errs.append(f"{m}:{type(e).__name__}")
-        if attempt == 0:
-            time.sleep(1.2)
-            order = order[1:] + order[:1]   # 换个顺序再试
-    return None, "；".join(errs[:4])
+        if USAGE.get("day") != day:
+            USAGE.clear()
+            USAGE.update({"day": day, "calls": 0, "cached": 0,
+                          "prompt": 0, "completion": 0, "by_model": {}})
+        USAGE["cached" if cached else "calls"] += 1
+        if usage:
+            USAGE["prompt"] += int(usage.get("prompt_tokens") or 0)
+            USAGE["completion"] += int(usage.get("completion_tokens") or 0)
+        bm = USAGE["by_model"].setdefault(model, {"calls": 0, "tokens": 0})
+        if not cached:
+            bm["calls"] += 1
+            bm["tokens"] += int((usage or {}).get("total_tokens") or 0)
+    try:
+        with USAGE_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "model": model,
+                                "cached": cached, "usage": usage or {}},
+                               ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _cache_get(key):
+    hit = CACHE.get(key)
+    if not hit:
+        return None
+    if time.time() - hit[2] > CACHE_TTL:
+        CACHE.pop(key, None)
+        return None
+    return hit
+
+
+def _cache_put(key, answer, model):
+    if len(CACHE) >= CACHE_MAX:
+        for k in sorted(CACHE, key=lambda k: CACHE[k][2])[:CACHE_MAX // 4]:
+            CACHE.pop(k, None)
+    CACHE[key] = [answer, model, time.time()]
+
+
+def _ctx(limit=CONV_MAX):
+    """上下文瘦身：只带最近几条，每条截断，避免请求越滚越贵。"""
+    out = []
+    for m in CONV[-limit:]:
+        c = (m.get("content") or "")
+        out.append({"role": m["role"], "content": c[:240]})
+    return out
+
+
+def ask_model(user_text, prefer=""):
+    """按难度路由 + 命中去重 + 失败才升级。"""
+    mode = _mode_of(user_text, prefer)
+    key = ((user_text or "").strip(), mode)
+    hit = _cache_get(key)
+    if hit:
+        _add_usage(hit[1], {}, cached=True)
+        return hit[0], "cache:" + hit[1]
+
+    ask_text = user_text
+    if mode == "short" and not any(k in user_text for k in ("详细", "为什么", "解释")):
+        ask_text = user_text + ("\n（问题很短，但请给完整讲解：① 一句话讲清是什么 "
+                                "② 为什么 / 怎么来的 ③ 一个例子、公式或生活场景 "
+                                "④ 最容易错的地方。总共 6~12 行，分点写）")
+    with _lock:
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + _ctx() + \
+                   [{"role": "user", "content": ask_text}]
+    budget = _budget(mode, prefer)
+    order = _route(mode)
+    # 用户在笔上手动点名了模型，就尊重他的选择（只是排到最前）
+    if prefer and prefer not in ("strong", "详细", "detailed"):
+        order = [prefer] + [m for m in order if m != prefer]
+    errs, best = [], None
+    for m in order[:3]:                 # 便宜的先试；答得太短就升级重答
+        try:
+            out, usage = _call_one(m, messages, budget)
+        except Exception as e:
+            errs.append("%s:%s" % (m, type(e).__name__))
+            continue
+        _add_usage(m, usage)
+        if not out:
+            errs.append(m + ":空回复")
+            continue
+        if best is None or len(out) > len(best[0]):
+            best = (out, m)
+        if len(out) >= 110 or mode == "strong":
+            _cache_put(key, out, m)
+            return out, m
+        errs.append(m + ":太短")
+    if best:
+        _cache_put(key, best[0], best[1])
+        return best
+    return None, "；".join(errs[:3])
 
 
 def _all_models():
@@ -220,10 +388,169 @@ def tidy(text):
     return t.strip()
 
 
+def _rev_load():
+    rows = []
+    if REVIEW.exists():
+        for line in REVIEW.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    pass
+    return rows
+
+
+def _rev_save(rows):
+    try:
+        REVIEW.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows),
+                          encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _due_in(days):
+    import datetime
+    return (datetime.date.today() + datetime.timedelta(days=days)).isoformat()
+
+
+def _is_word(text):
+    """整段只有英文单词/短语 → 当生词收录。"""
+    t = (text or "").strip()
+    if not t or len(t) > 40:
+        return False
+    if any(k in t for k in ("？", "?", "求", "计算", "已知")):
+        return False
+    letters = sum(1 for c in t if c.isascii() and c.isalpha())
+    return letters >= max(2, len(t) * 0.6) and len(t.split()) <= 4
+
+
+def _is_question(text):
+    t = text or ""
+    if any(k in t for k in ("求", "计算", "证明", "下列", "已知", "解答", "多少",
+                            "为什么", "？", "?")):
+        return True
+    return len(t) >= 24
+
+
+def rev_capture(q, a, subject):
+    """扫到的东西自动进本子：题目→错题本，英文词→生词本。同一题不重复收。"""
+    q = (q or "").strip()
+    a = (a or "").strip()
+    if not q or not a:
+        return None
+    kind = "word" if _is_word(q) else ("mistake" if _is_question(q) else None)
+    if not kind:
+        return None
+    with _lock:
+        rows = _rev_load()
+        for r in rows:
+            if (r.get("q") or "").strip() == q:
+                return r
+        rec = {"id": (max([r.get("id", 0) for r in rows]) if rows else 0) + 1,
+               "kind": kind, "q": q[:400], "a": a[:600], "subject": subject,
+               "ts": time.strftime("%Y-%m-%d %H:%M"), "box": 0,
+               "next": _due_in(0), "done": False, "hits": 0}
+        rows.append(rec)
+        _rev_save(rows)
+    return rec
+
+
+def rev_mark(item_id, result):
+    """good=会了（推后一档），again=再练（回到明天），done=已掌握（移出复习）。"""
+    import datetime
+    with _lock:
+        rows = _rev_load()
+        hit = None
+        for r in rows:
+            if int(r.get("id") or 0) == int(item_id):
+                hit = r
+                break
+        if hit is None:
+            return None
+        if result == "done":
+            hit["done"] = True
+        elif result == "again":
+            hit["box"] = 0
+            hit["next"] = _due_in(REV_BOXES[0])
+        else:
+            hit["box"] = min(int(hit.get("box") or 0) + 1, len(REV_BOXES) - 1)
+            hit["next"] = _due_in(REV_BOXES[hit["box"]])
+        hit["hits"] = int(hit.get("hits") or 0) + 1
+        hit["last"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        _rev_save(rows)
+    return hit
+
+
+def rev_due(rows=None):
+    import datetime
+    today = datetime.date.today().isoformat()
+    rows = _rev_load() if rows is None else rows
+    return [r for r in rows if not r.get("done") and (r.get("next") or "") <= today]
+
+
+def _rev_item(r):
+    """复习条目的对外形态：字段固定，长答案截断（和 rev_capture 的存储上限一致）。"""
+    return {"id": int(r.get("id") or 0),
+            "kind": r.get("kind") or "",
+            "q": (r.get("q") or "")[:400],
+            "a": (r.get("a") or "")[:600],
+            "subject": r.get("subject") or "其他",
+            "ts": r.get("ts") or "",
+            "box": int(r.get("box") or 0),
+            "next": r.get("next") or "",
+            "done": bool(r.get("done")),
+            "hits": int(r.get("hits") or 0)}
+
+
+def rev_pick(rows, tab="due", limit=20):
+    """按 tab 取条目：due=今天要复习，mistake=错题本，word=生词本（后两个按 next 升序）。"""
+    try:
+        limit = int(limit)
+    except Exception:
+        limit = 20
+    limit = max(1, min(limit, 60))
+    if tab == "word":
+        items = [r for r in rows if r.get("kind") == "word" and not r.get("done")]
+        items.sort(key=lambda r: r.get("next") or "")
+    elif tab == "mistake":
+        items = [r for r in rows if r.get("kind") == "mistake" and not r.get("done")]
+        items.sort(key=lambda r: r.get("next") or "")
+    else:
+        items = rev_due(rows)
+    return items[:limit]
+
+
+def save_shot(name, img_b64):
+    """APK 截图落盘：name 净化 + HHMMSS 时间戳 → shots/。失败也回 ok=False，不抛异常。"""
+    import base64
+    import re as _re
+    n = _re.sub(r"[^A-Za-z0-9_-]", "", name or "")[:40] or "shot"
+    img = (img_b64 or "").strip()
+    if img.startswith("data:"):
+        img = img.split(",", 1)[-1]
+    if len(img) < 32:
+        return {"ok": False, "error": "图片为空"}
+    try:
+        raw = base64.b64decode(img)
+    except Exception as e:
+        return {"ok": False, "error": "解码失败：" + str(e)[:80]}
+    if not raw:
+        return {"ok": False, "error": "解码后为空"}
+    if not (raw[:2] == b"\xff\xd8" or raw[:8] == b"\x89PNG\r\n\x1a\n"):
+        return {"ok": False, "error": "不是有效的 JPEG/PNG 图片"}
+    fn = "%s-%s.jpg" % (n, time.strftime("%H%M%S"))
+    try:
+        SHOTS.mkdir(parents=True, exist_ok=True)
+        (SHOTS / fn).write_bytes(raw)
+    except Exception as e:
+        return {"ok": False, "error": "写入失败：" + str(e)[:80]}
+    return {"ok": True, "file": "shots/" + fn, "bytes": len(raw)}
+
+
 def remember(user_text, answer_text, pkg=""):
     with _lock:
-        CONV.append({"role": "user", "content": user_text})
-        CONV.append({"role": "assistant", "content": answer_text})
+        CONV.append({"role": "user", "content": (user_text or "")[:240]})
+        CONV.append({"role": "assistant", "content": (answer_text or "")[:360]})
         del CONV[:-CONV_MAX]
         MSG_ID[0] += 1
         rec = {"id": MSG_ID[0], "ts": time.strftime("%H:%M:%S"),
@@ -243,7 +570,12 @@ def answer(user_text, pkg="", prefer=""):
     if out is None:
         out = "（免费模型这会儿在排队，没拿到回复）\n过十几秒再扫一次；或者点悬浮窗的「模型」换成「视觉/强」那个再试。"
         model = "error"
-    return remember(text, tidy(out), pkg), model
+    rec = remember(text, tidy(out), pkg)
+    try:
+        rev_capture(text, rec.get("a") or "", rec.get("subject") or classify(text))
+    except Exception:
+        pass
+    return rec, model
 
 
 # ---------------------------------------------------------------- 笔端页面
@@ -279,7 +611,7 @@ PAGE = r"""<!doctype html>
  .tip{font-size:12px;color:#6e7681;margin-top:8px;line-height:1.5}
 </style></head><body>
 <div class="top"><span><span class="dot" id="dot"></span><span id="st">就绪</span></span>
-<span id="model"></span></div>
+<span id="model" style="cursor:pointer" title="点一下换模型"></span></div>
 
 <textarea id="q" placeholder="在这里打字提问，或让手机遥控发过来…"></textarea>
 <div class="tip">点下面的按钮发送。想看手机遥控：在手机浏览器打开 /m</div>
@@ -294,6 +626,24 @@ PAGE = r"""<!doctype html>
 var q=document.getElementById('q'), feed=document.getElementById('feed'),
     st=document.getElementById('st'), dot=document.getElementById('dot'),
     sendBtn=document.getElementById('send');
+var PV=location.search.indexOf('pv=1')>=0;
+var CURMODEL=localStorage.getItem('pen_model')||'', MLIST=[];
+function mshort(m){ return m.replace(/^doubao:/,'豆包 ').replace(/^ark:/,''); }
+function refreshModel(){ document.getElementById('model').textContent =
+  (CURMODEL? '模型:'+mshort(CURMODEL) : '模型:自动'); }
+function loadModels(){
+  var x=new XMLHttpRequest(); x.open('GET','/api/models?t='+Date.now(),true);
+  x.onreadystatechange=function(){ if(x.readyState!==4) return;
+    try{ MLIST=JSON.parse(x.responseText).models||[]; }catch(e){ MLIST=[]; } };
+  x.send();
+}
+document.getElementById('model').onclick=function(){
+  if(!MLIST.length) loadModels();
+  var i=MLIST.indexOf(CURMODEL)+1;
+  if(i>MLIST.length) i=0;
+  CURMODEL = (i>=MLIST.length)? '' : MLIST[i];
+  localStorage.setItem('pen_model',CURMODEL); refreshModel();
+};
 var busy=false, lastId=0, seen={};
 
 function setSt(t,c){ st.textContent=t; dot.style.background=c||'#3fb950'; }
@@ -356,7 +706,7 @@ function ask(){
   var t=q.value.replace(/^\s+|\s+$/g,'');
   if(!t||busy) return;
   busy=true; setSt('思考中…','#d29922'); sendBtn.textContent='思考中…';
-  post('/api/ask',{text:t},function(j){
+  post('/api/ask',{text:t,model:CURMODEL},function(j){
     busy=false; sendBtn.textContent='发送';
     if(j && j.a){ q.value=''; addMsg(j); setSt('就绪','#3fb950'); }
     else { setSt('出错','#f85149'); alert('出错：'+JSON.stringify(j)); }
@@ -396,12 +746,61 @@ function pullMsgs(){
   x.send();
 }
 
-post('/api/health',{},function(j){
-  document.getElementById('model').textContent=(j.model||'');
+if(PV){addMsg({id:1,q:'勾股定理',a:'直角三角形的两条直角边平方和等于斜边平方：a²+b²=c²。',ts:'12:30'});addMsg({id:2,q:'为什么？',a:'在斜边上作正方形，用面积关系就能证明。',ts:'12:31'});}
+if(!PV) post('/api/health',{},function(j){
+  refreshModel(); loadModels();
   if(j.msgs){ for(var i=0;i<j.msgs.length;i++) addMsg(j.msgs[i]); }
   poll();
 });
 </script></body></html>"""
+
+
+
+# ---------------------------------------------------------------- 皮肤（design.json）
+import base64
+DESIGN_FILE = BASE / "design.json"
+DESIGN_DEFAULT = {"bg": "#0d1117", "card": "#161b22", "ink": "#e6edf3", "accent": "#4c9aff",
+                  "q": "#1b2430", "r": 12, "fs": 17, "lh": 1.55, "style": "card",
+                  "hideTop": 0, "note": ""}
+
+
+def load_design():
+    d = dict(DESIGN_DEFAULT)
+    try:
+        d.update(json.loads(DESIGN_FILE.read_text(encoding="utf-8")))
+    except Exception:
+        pass
+    return d
+
+
+def build_css(d):
+    g = lambda k: str(d.get(k, DESIGN_DEFAULT[k]))
+    o = []
+    o.append("body{background:%s !important;color:%s !important;"
+             "font-size:%spx !important;line-height:%s !important}"
+             % (g("bg"), g("ink"), g("fs"), g("lh")))
+    o.append("textarea{background:%s !important;color:%s !important;border-radius:%spx !important}"
+             % (g("card"), g("ink"), g("r")))
+    o.append(".msg{background:%s !important;color:%s !important;border-radius:%spx !important}"
+             % (g("card"), g("ink"), g("r")))
+    o.append(".msg.q{background:%s !important;color:%s !important}" % (g("q"), g("ink")))
+    o.append(".send{background:%s !important;border-radius:%spx !important}" % (g("accent"), g("r")))
+    o.append(".clr{background:%s !important;color:%s !important;border-radius:%spx !important}"
+             % (g("card"), g("ink"), g("r")))
+    o.append(".cp{background:%s !important;color:%s !important}" % (g("card"), g("ink")))
+    o.append(".bottom{background:%s !important}" % g("bg"))
+    if str(d.get("hideTop", 0)) not in ("0", "False", "false", ""):
+        o.append(".top{display:none !important}")
+    if d.get("style") == "bubble":
+        o.append(".msg{border-radius:18px !important}")
+    if d.get("style") == "plain":
+        o.append(".msg,.msg.q{background:transparent !important;border:0 !important;"
+                 "padding-left:2px !important}")
+    return '<style id="dskin">\n' + "\n".join(o) + "\n</style>"
+
+
+def page_html():
+    return PAGE.replace("</head>", build_css(load_design()) + "</head>", 1)
 
 
 CAM = r"""<!doctype html>
@@ -518,7 +917,7 @@ DL_PAGE = r"""<!doctype html>
 </style></head><body>
 <h1>装「笔问AI」到笔上</h1>
 <ol>
- <li>点下面的按钮下载（21 KB，很小）</li>
+ <li>点下面的按钮下载（约 1.8 MB，跟一集图片差不多大）</li>
  <li>下载完点开它安装；如果提示不允许，去 设置 → 安全 → 允许安装未知来源 → 选浏览器，再回来说装</li>
  <li>装好后打开「笔问AI」，地址和口令已经填好了，直接点<b>保存</b></li>
  <li>再点<b>打开无障碍设置</b>，在列表里找到「笔问AI」，打开开关，确认</li>
@@ -526,6 +925,8 @@ DL_PAGE = r"""<!doctype html>
 </ol>
 <a class="big" id="dl" href="/apk">下载 笔问AI.apk</a>
 <p class="warn">如果第 5 步没反应：回到 App 点「测试连接」看通不通。</p>
+<p class="note">先自检：地址栏打开 <b id="ping">/ping</b>，出现 pong 就说明这台笔能连到手机。</p>
+<script>document.getElementById("ping").innerHTML=location.host+"/ping";</script>
 <p class="note">这个工具只读屏幕上的文字发给你自己的服务器，不上传图片、不记录别的内容。</p>
 <script>
 var k=location.search;
@@ -643,6 +1044,68 @@ def load_rows(limit=400):
     return rows
 
 
+def review_page(tab="due"):
+    """复习页：今天要复习 / 错题本 / 生词本，间隔重复。"""
+    rows = _rev_load()
+    if tab == "due":
+        items = rev_due(rows)
+    elif tab == "word":
+        items = [r for r in rows if r.get("kind") == "word" and not r.get("done")]
+    else:
+        tab = "mistake"
+        items = [r for r in rows if r.get("kind") == "mistake" and not r.get("done")]
+    due = rev_due(rows)
+    tabs = [("due", "今天要复习 %d" % len(due)),
+            ("mistake", "错题本 %d" % sum(1 for r in rows if r.get("kind") == "mistake" and not r.get("done"))),
+            ("word", "生词本 %d" % sum(1 for r in rows if r.get("kind") == "word" and not r.get("done")))]
+    tabbar = "".join('<a class="tab%s" href="/review?k=%s&tab=%s">%s</a>'
+                     % (" on" if t == tab else "", TOKEN, t, label) for t, label in tabs)
+    cards = []
+    for r in reversed(items[-60:]):
+        q = (r.get("q") or "").replace("<", "&lt;").replace(">", "&gt;")
+        a = (r.get("a") or "").replace("<", "&lt;").replace(">", "&gt;")
+        rid = int(r.get("id") or 0)
+        box = int(r.get("box") or 0)
+        stage = "第 %d 档 · 下次 %s" % (box + 1, r.get("next") or "-")
+        cards.append(
+            '<div class="item"><div class="meta"><span>%s · %s</span><span>%s</span></div>'
+            '<div class="q">%s</div><div class="a">%s</div>'
+            '<div class="ops"><button onclick="mk(%d,\'good\')">会了</button>'
+            '<button onclick="mk(%d,\'again\')">再练</button>'
+            '<button class="dim" onclick="mk(%d,\'done\')">已掌握</button></div></div>'
+            % (r.get("ts") or "", r.get("subject") or "其他", stage, q, a, rid, rid, rid))
+    if not cards:
+        cards.append('<div class="empty">这里还空着。用笔扫几道题或几个英文单词就会自动进来。</div>')
+    return """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>复习</title>
+<style>
+body{margin:0;background:#0d1117;color:#e6edf3;font:16px/1.6 system-ui,sans-serif;padding:12px}
+h1{font-size:19px;margin:0 0 10px}
+.tab{display:inline-block;padding:7px 12px;margin:0 6px 6px 0;border-radius:20px;
+ background:#161b22;border:1px solid #30363d;color:#8b949e;text-decoration:none;font-size:14px}
+.tab.on{background:#4c9aff;color:#06121f;border-color:#4c9aff;font-weight:700}
+.item{background:#161b22;border:1px solid #21262d;border-radius:12px;padding:10px 12px;margin-bottom:10px}
+.meta{display:flex;justify-content:space-between;font-size:12px;color:#6e7681;margin-bottom:6px}
+.q{color:#a9c4e0;font-size:15px;white-space:pre-wrap;margin-bottom:6px}
+.a{color:#c9d1d9;font-size:14px;white-space:pre-wrap;border-top:1px dashed #21262d;padding-top:8px}
+.ops{margin-top:10px;display:flex;gap:8px}
+.ops button{flex:1;padding:9px 0;border-radius:10px;border:1px solid #30363d;background:#1f6f43;
+ color:#e6edf3;font-size:14px}
+.ops button.dim{background:#21262d;color:#8b949e}
+.empty{color:#6e7681;font-size:14px;padding:20px 4px}
+</style></head><body>
+<h1>复习</h1>%s
+<script>
+function mk(id, r){
+  fetch('/api/review/mark', {method:'POST', headers:{'Content-Type':'application/json',
+    'X-Pen-Key':'%s'}, body: JSON.stringify({id:id, result:r})})
+    .then(function(){ location.reload(); });
+}
+</script>
+%s
+</body></html>""" % (tabbar, TOKEN, "".join(cards))
+
+
 def log_page(sel=""):
     rows = load_rows()
     groups = {}
@@ -653,7 +1116,21 @@ def log_page(sel=""):
         if name in groups:
             tabs.append('<a class="tab%s" href="/log?k=%s&s=%s">%s %d</a>'
                         % (" on" if sel == name else "", TOKEN, name, name, len(groups[name])))
-    body = []
+    with _lock:
+        _u = dict(USAGE or {})
+    used = ("今日 %d 次调用 · 缓存命中 %d · 约 %d tokens"
+            % (_u.get("calls", 0), _u.get("cached", 0),
+               _u.get("prompt", 0) + _u.get("completion", 0)))
+    with _lock:
+        _rv = _rev_load()
+    _due = len(rev_due(_rv))
+    body = ['<div class="use">%s</div>'
+            '<div class="use" style="background:#12233a;border-color:#2b4a72;color:#a9c4e0">'
+            '<a href="/review?k=%s" style="color:#7ec8ff;text-decoration:none">复习：今天 %d 条 · '
+            '错题 %d · 生词 %d →</a></div>'
+            % (used, TOKEN, _due,
+               sum(1 for r in _rv if r.get("kind") == "mistake" and not r.get("done")),
+               sum(1 for r in _rv if r.get("kind") == "word" and not r.get("done")))]
     for name in SUB_ORDER:
         if name not in groups:
             continue
@@ -681,6 +1158,8 @@ h1{font-size:19px;margin:0 0 10px}
 .tab{display:inline-block;padding:7px 12px;margin:0 6px 6px 0;border-radius:20px;
  background:#161b22;border:1px solid #30363d;color:#8b949e;text-decoration:none;font-size:14px}
 .tab.on{background:#4c9aff;color:#06121f;border-color:#4c9aff;font-weight:700}
+.use{background:#0f2a1c;border:1px solid #1f6f43;color:#7ee787;border-radius:10px;
+ padding:8px 12px;font-size:13px;margin:2px 0 12px}
 h2{font-size:16px;margin:18px 0 8px;color:#7ee787}
 h2 span{font-size:12px;color:#6e7681;margin-left:8px;font-weight:400}
 .item{background:#161b22;border:1px solid #21262d;border-radius:12px;padding:10px 12px;margin-bottom:10px}
@@ -740,7 +1219,13 @@ class Handler(BaseHTTPRequestHandler):
         """返回 None=放行，或 ('redirect', url) / ('deny', None)"""
         from urllib.parse import parse_qs
         u = urlparse(self.path)
-        if u.path in ("/d", "/dl"):   # 笔上手打的短入口，允许不带口令（内部会种 cookie）
+        # 笔上手打的短入口 / 浏览器探活：允许不带口令（/d 内部会种 cookie）
+        # 这样笔端先用浏览器打开 http://IP:PORT/ 或 /ping 就能判断「到不到得了」，不会被 403 伪装成打不开
+        if u.path in ("/d", "/dl", "/", "/index.html", "/apk",
+                      "/api/version", "/ping", "/favicon.ico", "/design"):
+            return None
+        # 截图是给 App 里 ImageView 直接加载的，标签发不出 X-Pen-Key，路径再做一次白名单校验
+        if (u.path or "").startswith("/shots/"):
             return None
         q = parse_qs(u.query)
         if q.get("k", [""])[0] == TOKEN:
@@ -775,9 +1260,19 @@ class Handler(BaseHTTPRequestHandler):
             return
         p = urlparse(self.path).path
         if p in ("/", "/index.html"):
-            return self._send(200, PAGE, "text/html; charset=utf-8")
+            return self._send(200, page_html(), "text/html; charset=utf-8")
         if p == "/m":
             return self._send(200, MOBILE, "text/html; charset=utf-8")
+        if p == "/design":
+            f = BASE / "designer.html"
+            if not f.exists():
+                return self._json({"error": "缺 designer.html"}, 404)
+            return self._send(200, f.read_text(encoding="utf-8"), "text/html; charset=utf-8")
+        if p == "/api/models":
+            return self._json({"models": _all_models(), "doubao": bool(ARK_KEY),
+                               "doubao_model": DOUBAO_MODEL if ARK_KEY else ""})
+        if p == "/api/design":
+            return self._json(load_design())
         if p == "/cam":
             return self._send(200, CAM, "text/html; charset=utf-8")
         if p == "/log":
@@ -805,6 +1300,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if p == "/dl":
             return self._send(200, DL_PAGE, "text/html; charset=utf-8")
+        if p.startswith("/shots/"):
+            return self._shot_send(p[len("/shots/"):])
         if p == "/api/inbox":
             with _lock:
                 t, PENDING[0] = PENDING[0], None
@@ -823,9 +1320,47 @@ class Handler(BaseHTTPRequestHandler):
             from urllib.parse import parse_qs
             sub = (parse_qs(urlparse(self.path).query).get("s") or [""])[0]
             rows = load_rows(400)
+            counts = {}
+            for r in rows:   # 全学科分布，不受 s 过滤影响
+                k = r.get("subject") or "其他"
+                counts[k] = counts.get(k, 0) + 1
+            counts = {k: counts[k] for k in
+                      SUB_ORDER + sorted(k for k in counts if k not in SUB_ORDER)
+                      if k in counts}
             if sub:
                 rows = [r for r in rows if (r.get("subject") or "") == sub]
-            return self._json({"rows": rows[-60:]})
+            return self._json({"rows": rows[-60:], "counts": counts})
+        if p == "/api/review":
+            from urllib.parse import parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            tab = (qs.get("tab") or [""])[0].strip()
+            try:
+                limit = int((qs.get("limit") or ["20"])[0] or 20)
+            except Exception:
+                limit = 20
+            rows = _rev_load()
+            due = rev_due(rows)
+            items = rev_pick(rows, tab or "due", limit)
+            return self._json({"due": len(due), "total": len(rows),
+                               "mistake": sum(1 for r in rows if r.get("kind") == "mistake"
+                                              and not r.get("done")),
+                               "word": sum(1 for r in rows if r.get("kind") == "word"
+                                           and not r.get("done")),
+                               "items": [_rev_item(r) for r in items]})
+
+        if p == "/review":
+            from urllib.parse import parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            return self._send(200, review_page((qs.get("tab") or ["due"])[0]),
+                              "text/html; charset=utf-8")
+
+        if p == "/api/usage":
+            with _lock:
+                u = json.loads(json.dumps(USAGE or {}))
+            u["cache_size"] = len(CACHE)
+            u["models"] = {"fast": FAST, "strong": STRONG, "spare": SPARE}
+            return self._json(u)
+
         if p == "/api/messages":
             from urllib.parse import parse_qs
             after = int((parse_qs(urlparse(self.path).query).get("after") or ["0"])[0] or 0)
@@ -851,9 +1386,34 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
             return self._json({"version": ver, "size": size, "url": "/apk"})
+        if p == "/ping":
+            ver = 0
+            try:
+                ver = int((BASE / "penai.version").read_text(encoding="utf-8").strip())
+            except Exception:
+                pass
+            return self._send(200, "pong v%s %s\n" % (ver, time.strftime("%Y-%m-%d %H:%M:%S")),
+                              "text/plain; charset=utf-8")
         if p == "/api/health":
             return self._json({"ok": True, "model": MODELS[0], "msgs": self._recent(8)})
         self._json({"error": "not found"}, 404)
+
+    def _shot_send(self, name):
+        """GET /shots/<file>：只认 shots/ 目录下的 jpg/png，文件名白名单过滤防穿越。"""
+        import re as _re
+        if not _re.fullmatch(r"[A-Za-z0-9_.-]{1,120}", name or "") or ".." in name:
+            return self._json({"error": "not found"}, 404)
+        if not (name or "").lower().endswith((".jpg", ".jpeg", ".png")):
+            return self._json({"error": "not found"}, 404)
+        try:
+            f = (SHOTS / name).resolve()
+            if f.parent != SHOTS.resolve() or not f.is_file():
+                return self._json({"error": "not found"}, 404)
+            data = f.read_bytes()
+        except Exception:
+            return self._json({"error": "not found"}, 404)
+        return self._send(200, data,
+                          "image/png" if f.suffix.lower() == ".png" else "image/jpeg")
 
     def _recent(self, n):
         rows = []
@@ -890,6 +1450,28 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/health":
             return self._json({"ok": True, "model": MODELS[0],
                                "msgs": self._recent(8)})
+        if p == "/api/design":
+            d = load_design()
+            for k, v in (data or {}).items():
+                if k in DESIGN_DEFAULT:
+                    d[k] = v
+            try:
+                DESIGN_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
+            except Exception as e:
+                return self._json({"error": str(e)}, 500)
+            return self._json({"ok": True, "design": d})
+        if p == "/api/design_ref":
+            img = str(data.get("img") or "")
+            if img.startswith("data:"):
+                img = img.split(",", 1)[-1]
+            if len(img) < 100:
+                return self._json({"error": "图片为空"}, 400)
+            name = "ref_" + time.strftime("%m%d_%H%M%S") + ".png"
+            try:
+                (SHOTS / name).write_bytes(base64.b64decode(img))
+            except Exception as e:
+                return self._json({"error": str(e)}, 500)
+            return self._json({"ok": True, "name": name})
         if p == "/api/ask":
             rec, model = answer(str(data.get("text", "")),
                                 str(data.get("pkg") or ""),
@@ -920,6 +1502,15 @@ class Handler(BaseHTTPRequestHandler):
             HISTORY.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows),
                                encoding="utf-8")
             return self._json({"ok": True, "left": len(rows)})
+        if p == "/api/review/mark":
+            out = rev_mark(data.get("id"), str(data.get("result") or "good"))
+            return self._json({"ok": bool(out), "item": out})
+        if p == "/api/review/add":   # 手动补一条（网页上手输）
+            q = str(data.get("q") or "").strip()
+            if not q:
+                return self._json({"error": "q 必填"}, 400)
+            rec = rev_capture(q, str(data.get("a") or "（手动添加）"), classify(q))
+            return self._json({"ok": bool(rec), "item": rec})
         if p == "/api/do":   # 外部下发一条要笔执行的指令
             act = str(data.get("act") or "")
             arg = str(data.get("arg") or "")
@@ -940,6 +1531,9 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
             return self._json({"ok": True})
+        if p == "/api/shot":   # APK 截图上报（真机视觉验收）
+            return self._json(save_shot(str(data.get("name") or ""),
+                                        str(data.get("img") or "")))
         if p == "/api/diag":
             pkg = str(data.get("pkg") or "")
             txt = str(data.get("text") or "")
